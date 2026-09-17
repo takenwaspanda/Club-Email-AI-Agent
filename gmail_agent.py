@@ -25,16 +25,36 @@ SCOPES = ['https://www.googleapis.com/auth/gmail.modify']
 TARGET_LABEL_NAME = "2026-27 Exel Uy"
 PROCESSED_IDS_FILE = "processed_ids.json"
 
+rubric = f"""
+Mark as important if it:
+    "- Is addressed to Exel specifically or requires a personal decision/reply from him
+      (can be a general inquiry from a club member regarding Culture Show applications,
+      auditions, or logistics)
+    - Involves a deadline, task, or responsibility tied to his role as Culture Show Director
+    - Comes from a known collaborator (e.g. Sam Cubbage, the Production Coordinator and theater venue contact) —
+      any email from a named collaborator should default to important
+    - Comes from club officers, university administration, or sponsors,
+      regarding show logistics, approvals, or a request that needs a response
+
+    Mark as NOT important if it's a promotional email, newsletter, automated marketing,
+    or a general announcement that doesn't need individual action.
+"""
+
 # Pydantic Schema (Blueprint for important emails)
+# Changed to Batch-Based
 class EmailImportance(BaseModel):
+    id: str
     is_important: bool = Field(
-        description="True if this email is important and requires Exel's personal attention; "
+        description="True if this email is important and requires the Culture Show Director's personal attention; "
                     "False for newsletters, promotions, spam, or general club-wide blasts "
                     "that don't need direct action."
     )
     reason: str = Field(
         description="One short sentence explaining why it was flagged important or not."
     )
+
+class BatchResult(EmailImportance):
+    results: list[EmailImportance]
 
 # Functions
 def authenticate_gmail(account):
@@ -178,7 +198,51 @@ def apply_label(service, msg_id, label_id):
     print(f"Labeled message {msg_id} as important (left unread status untouched).")
     return updated_message
 
-def analyze_email_with_ai(sender, subject, body):
+# New analyze emails function
+# Classify email batches in one call instead of one email per call.
+def analyze_emails_with_ai(emails, max_retries=3):
+    email_blocks = "\n\n".join(
+        f"ID: {e['id']}\nSender: {e['sender']}\nSubject: {e['subject']}\nBody: {(e['body'] or '(no body)')[:2000]}"
+        for e in emails
+    )
+
+    prompt=f"""
+    You will classify multiple emails below. For each one, decide if it is IMPORTANT 
+    and requires direct, personal attention.
+
+    {rubric}
+    
+
+    Return one result per email, matching each result's "id" field exactly to the 
+    email's ID below.
+
+    EMAILS:
+    {email_blocks}
+    """
+
+    for attempt in range(max_retries):
+        try:
+            response = client.models.generate_content(
+                model='gemini-3.6-flash',
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=BatchResult,
+                    system_instruction="You are a precise email triage assistant screening the Culture Show Director's inbox."
+                ),
+            )
+            return BatchResult.model_validate_json(response.text).results
+        except Exception as e:
+            if attempt < max_retries - 1:
+                wait = 2 ** (attempt + 2)
+                time.sleep(wait)
+            else:
+                print(f"Batch classification failed after {max_retries} attempts: {e}")
+                return []
+
+
+'''
+def analyze_emails_with_ai(sender, subject, body):
     content = body[:3000] if body else "(no body content available)"
 
     prompt = f"""
@@ -219,28 +283,32 @@ def analyze_email_with_ai(sender, subject, body):
     except Exception as e:
         print(f"Skipped classification for '{subject}' due to error: {e}")
         return None
-
+'''
 def process_inbox_agent(service, max_emails=5):
-    TARGET_LABEL_NAME = "2026-27 Exel Uy"
     label_id = get_or_create_label(service, TARGET_LABEL_NAME)  # fetched ONCE, not per email
-
     processed_ids = load_processed_ids()
     emails = get_unread_emails(service, max_results=max_emails)
 
+    # If no emails at all (edge case)
     if not emails:
         print("No unread emails to process.")
         return
 
+    # If no new emails
     new_emails = [e for e in emails if e['id'] not in processed_ids]
+    if not new_emails:
+        print("Nothing new to classify.")
+        return
+
     print(f"{len(emails)} unread, {len(new_emails)} not yet classified.\n")
 
-    for email in new_emails:
-        analysis = analyze_email_with_ai(
-            sender=email['sender'], subject=email['subject'], body=email['body']
-        )
+    results = analyze_emails_with_ai(new_emails, rubric)
+    results_by_id = {r.id: r for r in results}
 
+    for email in new_emails:
+        analysis = results_by_id.get(email['id'])
         if analysis is None:
-            continue  # NEW — skip this email, don't mark as processed, retry next run
+            continue
 
         if analysis.is_important:
             apply_label(service, email['id'], label_id)
@@ -250,7 +318,6 @@ def process_inbox_agent(service, max_emails=5):
 
         processed_ids.add(email['id'])
 
-        time.sleep(15) # double check if this is a valid approach
     save_processed_ids(processed_ids)
 
 if __name__ == "__main__":
