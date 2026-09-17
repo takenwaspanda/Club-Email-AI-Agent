@@ -1,6 +1,6 @@
 ﻿# Club Email AI Agent
 
-An AI agent that monitors a Gmail inbox, classifies unread emails
+An AI-powered agent that monitors a Gmail inbox, classifies unread emails
 as important or not using Gemini's structured output mode, and applies a
 Gmail label to anything flagged important — leaving everything else untouched.
 
